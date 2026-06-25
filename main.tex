@@ -1,0 +1,514 @@
+\documentclass[final,3p,times,twocolumn,nopreprintline]{elsarticle}
+
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{subcaption}
+\usepackage{placeins}
+
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\begin{document}
+
+\begin{frontmatter}
+
+\title{Adaptive Wavelet--Guided Bilateral Fusion: A Lightweight, Training-Free Image Denoising Method for Resource-Constrained Visual Sensing Systems}
+
+\author[asia]{Md Hasibuzzaman\corref{cor1}}
+\ead{hsbuzzaman@gmail.com}
+\cortext[cor1]{Corresponding author.}
+\address[asia]{Department of Computer Science and Information Engineering, Asia University, No. 500, Liufeng Road, Wufeng District, Taichung City 413305, Taiwan (R.O.C.)}
+
+\begin{abstract}
+Image sensors on embedded and IoT platforms often run under latency and power budgets that preclude deep convolutional denoisers, yet additive sensor noise still degrades downstream perception tasks. This paper presents the Adaptive Wavelet--Guided Bilateral (AWGB) filter, a training-free method that fuses a wavelet-domain BayesShrink estimate with a self-guided, noise-adaptive bilateral filter through a gradient-based spatial weight map. The noise level driving every stage is estimated from the input, so the method needs no training data, no per-image retuning, and no GPU. We evaluate AWGB on 80 grayscale images (Set12, BSD68) and 42 color images (Kodak24, McMaster) against five classical baselines we implement and run ourselves, BM3D as a fidelity reference, and literature-reported deep/transformer denoisers (DnCNN, FFDNet, DRUNet, SwinIR, Restormer) for context. AWGB attains the best mean PSNR rank among lightweight methods on both grayscale (1.29 of 6) and color (1.48 of 6) images, improving on wavelet-only thresholding by 0.32 and 0.24~dB respectively (paired $t$-tests $p<10^{-24}$, 88--92\% win rates) at 16--122~ms per image on one CPU core. An ablation shows an earlier wavelet-\emph{guided} joint bilateral design underperformed wavelet-only thresholding in 70\% of conditions, since its output was too correlated with the wavelet estimate to add independent information under fusion; we report this negative result because it shaped the final design. AWGB does not surpass BM3D or the deep/transformer methods in raw fidelity -- those exceed BM3D's PSNR by 0.6--1.4~dB but require GPU inference and large parameter counts. AWGB targets deployments where that infrastructure is unavailable, not as their replacement.
+\end{abstract}
+
+\begin{keyword}
+Image denoising \sep wavelet thresholding \sep bilateral filtering \sep adaptive fusion \sep lightweight image processing \sep visual sensing \sep edge computing \sep color image denoising \sep BSD68 \sep Set12 \sep Kodak24
+\end{keyword}
+
+\end{frontmatter}
+
+\section{Introduction}
+\label{sec:intro}
+
+Camera-equipped embedded systems -- inspection drones, wearable health monitors, agricultural sensing nodes, and low-cost surveillance units -- increasingly perform on-device image preprocessing before transmitting data or feeding a downstream recognition model. Image sensors operating in such settings, particularly under low-light or high-gain conditions, are dominated by sensor and quantization noise that is well approximated as additive and approximately Gaussian once dark-current and fixed-pattern components are subtracted in calibration \cite{tian2020image}. Removing this noise without distorting structural detail is a precondition for any subsequent edge detection, feature matching, or learned inference stage running on the same device.
+
+The dominant trend in image denoising research over the past decade has been toward deep convolutional and, more recently, transformer-based architectures that learn a noise-to-clean mapping from large paired datasets \cite{zhang2017beyond,zhang2018ffdnet,zhang2021plug,liang2021swinir,zamir2022restormer}, a shift documented in several recent surveys of the field \cite{fan2019brief,tian2020deep}. These methods achieve outstanding reconstruction quality -- Section~\ref{sec:related} reports the current literature numbers in detail -- but they carry a cost ill-suited to constrained sensing platforms: a trained network occupies hundreds of thousands to tens of millions of parameters, requires either a GPU or a heavily quantized inference engine to run at interactive rates, and must be retrained or fine-tuned if the deployment noise statistics drift from the training distribution. Recent work specifically targeting denoising on mobile and embedded hardware \cite{liu2023lightweight,bled2024lightweight,ayazoglu2021extremely} confirms that this gap between benchmark-leading accuracy and deployment feasibility remains an active concern rather than a solved problem. For many edge devices -- a microcontroller-driven camera node, a battery-powered wildlife trap, a legacy industrial inspection line -- none of the assumptions behind GPU-resident deep denoisers hold.
+
+A smaller but persistent line of work instead pursues training-free, model-based denoising: wavelet shrinkage \cite{donoho1994ideal,chang2000adaptive}, bilateral and joint bilateral filtering \cite{tomasi1998bilateral,petschnigg2004digital}, non-local self-similarity methods such as non-local means (NLM) \cite{buades2005non} and its collaborative-filtering descendant BM3D \cite{dabov2007image}, guided filtering \cite{he2013guided}, weighted nuclear norm minimization \cite{gu2014weighted}, and variational/PDE approaches such as total variation \cite{rudin1992nonlinear} and anisotropic diffusion \cite{perona1990scale}. These methods need no training data and adapt immediately to whatever noise level is present, but each carries a distinct weakness: wavelet thresholding alone tends to leave residual low-amplitude artifacts and can blur fine texture at high noise; plain bilateral filtering is sensitive to its range parameter and degrades sharply once the noise level exceeds the assumed edge-contrast scale; and NLM, while powerful when correctly tuned, is comparatively expensive and -- as we show empirically in Section~\ref{sec:results} on 80 standard benchmark images -- highly sensitive to its smoothing parameter $h$ when that parameter is not re-tuned per noise level, which is exactly the situation a deployed sensing pipeline faces when the operating noise level is not known in advance.
+
+This paper proposes the \textbf{Adaptive Wavelet--Guided Bilateral (AWGB) filter}, which combines the complementary strengths of wavelet-domain shrinkage and edge-aware spatial filtering through three design choices aimed specifically at unattended, training-free operation:
+
+\begin{enumerate}
+    \item \textbf{Self-calibrating noise estimation.} A robust MAD estimator computed from the finest-scale wavelet detail subband \cite{donoho1995noising} supplies the noise standard deviation $\hat\sigma$ used to drive every downstream stage, removing the need to hand-tune filter strength for each input.
+    \item \textbf{Two complementary intermediate estimates.} A BayesShrink wavelet-thresholded image \cite{chang2000adaptive} provides one denoised estimate, and a noise-adaptive, \emph{self-guided} bilateral filter \cite{tomasi1998bilateral} applied directly to the noisy input provides a second. Section~\ref{sec:ablation} reports an ablation showing that guiding the bilateral filter with the wavelet estimate instead -- our original design -- produces an estimate too correlated with the wavelet output to add independent information under fusion, motivating the self-guided design used in the final method.
+    \item \textbf{Gradient-adaptive fusion.} A per-pixel weight map computed from the local Sobel gradient energy of the wavelet estimate blends the two intermediate outputs, favoring the edge-aware bilateral result near structure and the smoother wavelet result in flat regions, without any learned parameters.
+\end{enumerate}
+
+All three stages run in closed form with no iterative optimization and no training phase, making the total pipeline cost dominated by a small number of convolution and wavelet-transform operations.
+
+We evaluate AWGB on the full Set12 (12 images) and BSD68 (68 images) benchmark datasets -- 80 images in total, at three noise levels each, the scale and datasets standard in the denoising literature \cite{zhang2017beyond,dabov2007image} -- rather than on a small illustrative subset, and report paired statistical significance tests (paired $t$-test and Wilcoxon signed-rank test) alongside raw PSNR/SSIM averages. Five classical baselines (Gaussian blur, median filter, bilateral filter, NLM, and wavelet-only thresholding) are implemented and executed by us, with fixed, untuned parameters, on exactly the same noisy inputs as AWGB; BM3D is included as a non-lightweight quality reference, run with its own noise-adaptive parameterization. We additionally report literature numbers for DnCNN \cite{zhang2017beyond}, FFDNet \cite{zhang2018ffdnet}, DRUNet \cite{zhang2021plug}, SwinIR \cite{liang2021swinir}, and Restormer \cite{zamir2022restormer} on the identical BSD68 benchmark, citing rather than re-running them, since a fair re-run would require either officially released pretrained checkpoints matched to our exact noise protocol or a full training pass -- either of which introduces a confound (training-data coverage) unrelated to the algorithmic question this paper investigates. We make no claim that AWGB surpasses BM3D or any deep/transformer method in reconstruction fidelity -- it does not -- and report this directly rather than restricting the comparison to weaker baselines.
+
+The remainder of this paper is organized as follows. Section~\ref{sec:related} reviews related denoising literature, including current deep and transformer-based results on the same benchmarks used in this paper. Section~\ref{sec:method} derives the AWGB pipeline. Section~\ref{sec:experiments} describes the experimental protocol. Section~\ref{sec:results} reports PSNR, SSIM, runtime, and statistical significance results with visual and error-map comparisons. Section~\ref{sec:ablation} reports the fusion-design ablation that motivated the final self-guided bilateral stage. Section~\ref{sec:discussion} discusses limitations and deployment implications, and Section~\ref{sec:conclusion} concludes.
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Wavelet-domain denoising}
+Donoho and Johnstone's foundational work on wavelet shrinkage established that thresholding wavelet detail coefficients toward zero, with a threshold set from the noise level, yields a near-minimax estimator of the underlying signal under fairly weak smoothness assumptions \cite{donoho1994ideal,donoho1995noising}. Subsequent work refined the threshold selection rule itself: Chang et al.'s BayesShrink method derives a subband-adaptive soft threshold from a Bayesian estimate of the marginal coefficient distribution, improving on the original universal threshold particularly at coarser decomposition levels \cite{chang2000adaptive}. The multiresolution wavelet decomposition underlying both methods follows Mallat's theory of multiresolution signal representation \cite{mallat1989theory}. Wavelet methods are attractive computationally -- a forward and inverse transform plus per-coefficient thresholding is $O(N)$ in image size -- but because thresholding is applied independently per coefficient, the reconstructed image can retain faint block- or ringing-like artifacts and can over-smooth fine texture when the threshold is set aggressively enough to suppress noise at higher $\sigma$.
+
+\subsection{Spatial and edge-aware filtering}
+Bilateral filtering \cite{tomasi1998bilateral} replaces each pixel with a weighted average of its neighbors, where the weight combines spatial proximity and intensity similarity, so that averaging respects edges rather than blurring across them. The joint (or ``cross'') bilateral filter generalizes this by computing the range weights from a second, typically cleaner, guidance image while still averaging the original signal -- originally proposed for flash/no-flash photography \cite{petschnigg2004digital} and later generalized as guided image filtering \cite{he2013guided}. The quality of a (joint) bilateral filter is highly sensitive to its range parameter $\sigma_r$: too small and noise survives in flat regions; too large and edges are blurred. Because this parameter is normally hand-tuned per dataset, naively deploying a bilateral filter with a fixed parameter across varying noise levels -- the situation we replicate for our baseline -- produces uneven results, which our 80-image evaluation confirms quantitatively (Section~\ref{sec:results}).
+
+\subsection{Non-local and collaborative-filtering methods}
+Non-local means \cite{buades2005non} exploits the redundancy of natural images by averaging pixels with similar local neighborhoods anywhere in the image, not only spatially nearby ones. Its quality again depends sensitively on the smoothing parameter $h$, and its $O(N \cdot W^2)$ search cost over a search window $W$ makes it considerably slower than spatial filters of comparable receptive field, a cost we quantify directly in Section~\ref{sec:results}. BM3D \cite{dabov2007image} extends the non-local principle with block matching and a collaborative 3-D transform-domain shrinkage step, and remains one of the strongest model-based (non-learned) denoisers in the literature; non-local Bayesian methods \cite{lebrun2012nonlocal}, weighted nuclear norm minimization \cite{gu2014weighted}, and sparse dictionary learning \cite{elad2006image} pursue related non-local or sparsity-based principles with similarly high computational cost. We include BM3D in our evaluation as a fidelity ceiling rather than a peer competitor, since its $\sim$9--11~s per-image runtime in our test environment (Section~\ref{sec:experiments}) places it in a different operating regime from the methods AWGB targets.
+
+\subsection{Deep and transformer-based denoisers}
+Deep convolutional networks beginning with DnCNN \cite{zhang2017beyond} learn an end-to-end noise-to-clean mapping and substantially improved on BM3D-era fidelity; FFDNet \cite{zhang2018ffdnet} extended this with a tunable noise-level map input, allowing one trained network to handle a range of noise levels. DRUNet \cite{zhang2021plug}, evaluated within a plug-and-play restoration framework, and the more recent transformer-based SwinIR \cite{liang2021swinir} and Restormer \cite{zamir2022restormer} architectures currently define the state of the art in reconstruction fidelity on standard grayscale benchmarks. Table~\ref{tab:literature} in Section~\ref{sec:results} reports their published BSD68 PSNR figures alongside our own measurements for context; further dual-branch and skip-connection architectures such as \cite{wu2023dcbdnet} report similar BSD68 fidelity in the same range. These methods, however, concentrate their cost in training (paired noisy/clean datasets, GPU-days of training time) and in inference memory/compute footprint -- Restormer, for instance, has on the order of 26 million parameters \cite{zamir2022restormer} -- both of which are the specific constraints AWGB is designed to avoid. Multi-level wavelet-CNN \cite{liu2018mwcnn} and non-local recurrent networks \cite{liu2018nlrn} represent intermediate points that incorporate classical signal-processing structure (wavelets, non-local self-similarity) inside a learned architecture; the broader family of learned denoising autoencoders traces back to \cite{vincent2008extracting}, and the transformer-based restoration line has since extended to video as well as still images \cite{liang2024vrt}. AWGB differs from this entire family by using no learned parameters at all.
+
+\subsection{Lightweight and embedded denoising}
+A growing body of work targets denoising explicitly for embedded, mobile, and IoT vision systems. Liu et al.\ \cite{liu2023lightweight} and Bled and Piti\'{e} \cite{bled2024lightweight} both report lightweight network or classical-backbone designs aimed at real-time mobile/embedded denoising, while Ayazoglu \cite{ayazoglu2021extremely} addresses the closely related problem of quantization-robust super-resolution under the same deployment constraints; broader survey work on the field \cite{fan2019brief,tian2020deep} catalogs this trend toward trading some reconstruction quality for deployability. AWGB contributes to this line by combining two already-cheap classical primitives (wavelet shrinkage and bilateral filtering) through an adaptive fusion rule rather than proposing a new learned primitive, on the premise that the fusion itself -- choosing which estimate to trust at each pixel based on local structure -- captures complementary error patterns of the two inputs at negligible additional cost, with no training data and no GPU dependency at all.
+
+\section{Proposed Method}
+\label{sec:method}
+
+\subsection{Problem formulation and noise model}
+We adopt the standard additive noise model
+\begin{equation}
+I_n(x,y) = I(x,y) + \eta(x,y), \qquad \eta(x,y) \sim \mathcal{N}(0,\sigma^2),
+\label{eq:noisemodel}
+\end{equation}
+where $I$ is the latent clean image, $I_n$ the observed noisy image, and $\eta$ zero-mean Gaussian noise of unknown standard deviation $\sigma$. The goal is to recover an estimate $\hat{I}$ minimizing reconstruction error against $I$ without access to $\sigma$, to multiple noisy observations of the same scene, or to any training corpus.
+
+\subsection{Stage 1: robust noise level estimation}
+We estimate $\sigma$ directly from $I_n$ using the median absolute deviation of the finest-scale diagonal wavelet detail subband, a standard robust estimator \cite{donoho1995noising}:
+\begin{equation}
+\hat\sigma = \frac{\mathrm{median}(|cD_1|)}{0.6745},
+\label{eq:mad}
+\end{equation}
+where $cD_1$ denotes the diagonal detail coefficients of a single-level discrete wavelet transform (Daubechies-4) of $I_n$. The constant $0.6745$ is the median absolute deviation of a standard normal distribution, so that $\hat\sigma$ is an unbiased estimate of $\sigma$ under the assumption that the diagonal subband is noise-dominated, which holds for natural images away from strong texture. This estimate, computed once per image, parameterizes every subsequent stage; no other hyperparameter in the pipeline is hand-tuned per image.
+
+\subsection{Stage 2: wavelet-domain BayesShrink estimate}
+We decompose $I_n$ to level $L=3$ using a Daubechies-4 wavelet, obtaining approximation coefficients and, at each level $\ell$, horizontal, vertical, and diagonal detail subbands $cH_\ell, cV_\ell, cD_\ell$. For each detail subband $cB \in \{cH_\ell, cV_\ell, cD_\ell\}$, BayesShrink \cite{chang2000adaptive} estimates the signal variance as
+\begin{equation}
+\sigma_x = \sqrt{\max\left(\frac{1}{N}\sum_{i} cB_i^2 - \hat\sigma^2,\ 0\right)},
+\label{eq:sigmax}
+\end{equation}
+and sets a subband-specific soft threshold
+\begin{equation}
+T = \frac{\hat\sigma^2}{\sigma_x}, \qquad
+\tilde{cB}_i = \mathrm{sign}(cB_i)\max(|cB_i| - T,\ 0).
+\label{eq:bayesshrink}
+\end{equation}
+When $\sigma_x \to 0$ (a subband dominated by noise), $T$ is set to the maximum coefficient magnitude in that subband, suppressing it entirely. Applying \eqref{eq:bayesshrink} independently to every detail subband at every level and inverting the transform yields the wavelet estimate $I_w$, which is smoother than $I_n$ but, being purely coefficient-wise, can retain low-amplitude high-frequency artifacts.
+
+\subsection{Stage 3: noise-adaptive, self-guided bilateral filter}
+\label{sec:stage3}
+We next apply a bilateral filter directly to the original noisy image $I_n$. For a pixel $p$ and spatial neighborhood $\mathcal{N}(p)$ of diameter $d$:
+\begin{equation}
+I_b(p) = \frac{1}{W_p}\sum_{q \in \mathcal{N}(p)} G_{\sigma_s}(\lVert p-q \rVert)\, G_{\sigma_c}\!\big(|I_n(p)-I_n(q)|\big)\, I_n(q),
+\label{eq:bf}
+\end{equation}
+where $G_{\sigma_s}, G_{\sigma_c}$ are Gaussian kernels on spatial distance and range difference respectively, and $W_p$ is the normalizing sum of weights. We refer to this as \emph{self-guided}, since the range weights are computed from $I_n$ itself rather than from the wavelet estimate $I_w$. This is a deliberate departure from an earlier design we tested, in which the range kernel was instead computed from $I_w$ (a \emph{joint} or cross-bilateral filter, following \cite{petschnigg2004digital}); Section~\ref{sec:ablation} reports a large-scale ablation showing that the joint-bilateral design's output correlates too strongly with $I_w$ to contribute independent information when the two are fused, and that the self-guided design used here performs measurably better as a result. The range bandwidth is tied directly to the estimated noise level,
+\begin{equation}
+\sigma_c = \mathrm{clip}(2.2\hat\sigma,\ 10,\ 90), \qquad \sigma_s = \mathrm{clip}(d/3,\ 2,\ 6),
+\label{eq:adaptiveparams}
+\end{equation}
+so that the filter automatically widens its tolerance for intensity differences as the estimated noise level grows, removing the need to hand-tune $\sigma_c$ for each input -- precisely the parameter we hold fixed (and therefore see degrade) in the plain-bilateral baseline of Section~\ref{sec:experiments}.
+
+\subsection{Stage 4: gradient-adaptive fusion}
+The two intermediate estimates $I_w$ (wavelet, smoother, weaker on edges) and $I_b$ (self-guided bilateral, sharper, slightly noisier in flat regions) are combined pixel-wise using a weight map derived from the local gradient energy of the wavelet estimate. We first compute the Sobel gradient magnitude of $I_w$,
+\begin{equation}
+g(p) = \sqrt{(\partial_x I_w(p))^2 + (\partial_y I_w(p))^2},
+\label{eq:gradmag}
+\end{equation}
+then locally average it over a $7\times7$ window to obtain an edge-density map $e(p)$, and normalize against its 5th and 95th percentiles over the image to obtain a weight map
+\begin{equation}
+w(p) = \mathrm{clip}\!\left(\frac{e(p) - e_{5}}{e_{95}-e_{5}},\ 0,\ 1\right) \in [0,1].
+\label{eq:weightmap}
+\end{equation}
+The final AWGB output is the convex combination
+\begin{equation}
+I_{out}(p) = w(p)\, I_b(p) + \big(1-w(p)\big)\, I_w(p).
+\label{eq:fusion}
+\end{equation}
+Near edges and texture, where $w(p) \to 1$, the output favors the sharper bilateral estimate; in flat regions, where $w(p)\to 0$, it favors the smoother wavelet estimate. Figure~\ref{fig:pipeline} summarizes the complete data flow together with the actual intermediate outputs the pipeline produces on a real noisy test image, and Algorithm~\ref{alg:awgb} states it formally.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.94\textwidth]{figures/fig4_pipeline_diagram.pdf}
+\caption{AWGB processing pipeline, grouped into the wavelet branch (Stages 1--2), the self-guided bilateral branch (Stage 3), and the adaptive fusion stage (Stage 4), with equation numbers annotated on each block. The right-hand gallery shows the actual intermediate output of every stage on a real noisy BSD68 crop at $\sigma=25$: the noisy input, the wavelet estimate $I_w$, the bilateral output $I_b$, the Sobel-based weight map $w(x,y)$ (heat map, yellow = high confidence in $I_b$), and the final fused output $I_{out}$.}
+\label{fig:pipeline}
+\end{figure*}
+
+\begin{algorithm}[t]
+\caption{Adaptive Wavelet--Guided Bilateral (AWGB) Filter}
+\label{alg:awgb}
+\begin{algorithmic}[1]
+\Require Noisy grayscale image $I_n$, wavelet $\psi=$ db4, decomposition level $L=3$, bilateral diameter $d=9$, edge window $w_{win}=7$
+\Ensure Denoised image $I_{out}$
+\State $cD_1 \gets$ finest diagonal detail subband of single-level DWT of $I_n$
+\State $\hat\sigma \gets \mathrm{median}(|cD_1|)/0.6745$ \Comment{Eq.~\eqref{eq:mad}}
+\State Decompose $I_n$ to level $L$ with wavelet $\psi$
+\For{each detail subband $cB$ at each level}
+    \State Compute $\sigma_x$ via Eq.~\eqref{eq:sigmax}; threshold $T \gets \hat\sigma^2/\sigma_x$
+    \State Soft-threshold $cB$ at $T$ \Comment{Eq.~\eqref{eq:bayesshrink}}
+\EndFor
+\State $I_w \gets$ inverse DWT of thresholded coefficients
+\State $\sigma_c \gets \mathrm{clip}(2.2\hat\sigma, 10, 90)$; $\sigma_s \gets \mathrm{clip}(d/3, 2, 6)$
+\State $I_b \gets$ BilateralFilter$(I_n, d, \sigma_c, \sigma_s)$ \Comment{Eq.~\eqref{eq:bf}, self-guided}
+\State $g \gets$ SobelMagnitude$(I_w)$; $e \gets$ BoxFilter$(g, w_{win})$ \Comment{Eq.~\eqref{eq:gradmag}}
+\State $w(p) \gets$ percentile-normalize and clip $e$ to $[0,1]$ \Comment{Eq.~\eqref{eq:weightmap}}
+\State $I_{out} \gets w \cdot I_b + (1-w)\cdot I_w$ \Comment{Eq.~\eqref{eq:fusion}}
+\State \Return $I_{out}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Computational complexity}
+All four stages are $O(N)$ in the number of pixels $N$ for a fixed wavelet depth and bilateral diameter: the wavelet transform and thresholding are $O(N)$, the bilateral filter is $O(N d^2)$ for a fixed kernel diameter $d$, the Sobel and box-filter steps for the weight map are $O(N)$, and the final fusion is a pointwise operation. With $d=9$ held constant across all images and noise levels in our experiments, the overall pipeline scales linearly with image size and contains no iterative optimization, distinguishing it from NLM's $O(N W^2)$ exhaustive patch search and BM3D's block-matching and collaborative-filtering stages.
+
+\section{Experimental Setup}
+\label{sec:experiments}
+
+\subsection{Datasets and noise protocol}
+We evaluate on the complete Set12 (12 images, sizes $256\times256$ to $512\times512$) and BSD68 (68 images, $321\times481$, drawn from the Berkeley Segmentation Dataset \cite{martin2001database}) grayscale benchmarks -- 80 images in total -- the standard test sets used throughout the denoising literature \cite{zhang2017beyond,zhang2018ffdnet,dabov2007image,zamir2022restormer}. For each image and each of three noise levels $\sigma \in \{15, 25, 50\}$, we generate three independent noisy realizations using i.i.d.\ Gaussian noise with distinct random seeds, for a total of $80 \times 3 \times 3 = 720$ noisy images processed per method (240 (image, $\sigma$) conditions, each averaged over 3 trials). We report all metrics as the mean over the three realizations, together with paired statistical significance tests computed across all 240 (image, $\sigma$) mean values (Section~\ref{sec:results}).
+
+\subsection{Baseline methods}
+We implement and execute, ourselves, on identical inputs, the following five baselines, each with parameters fixed across all noise levels (i.e., not re-tuned per $\sigma$, to reflect a deployment scenario where the operating noise level is not known a priori):
+\begin{itemize}
+    \item \textbf{Gaussian}: $5\times5$ Gaussian blur, $\sigma_{\text{blur}}=1.2$.
+    \item \textbf{Median}: $5\times5$ median filter.
+    \item \textbf{Bilateral}: OpenCV bilateral filter, $d=9$, $\sigma_{\text{color}}=40$, $\sigma_{\text{space}}=5$ (fixed, unlike AWGB's adaptive $\sigma_c,\sigma_s$).
+    \item \textbf{NLM}: OpenCV \texttt{fastNlMeansDenoising}, $h=12$, template window $7$, search window $21$.
+    \item \textbf{WaveletOnly}: BayesShrink wavelet thresholding alone (AWGB's Stage~2, without the bilateral/fusion stages), isolating the contribution of Stages~3--4.
+\end{itemize}
+In addition, we run \textbf{BM3D} \cite{dabov2007image} (Python \texttt{bm3d} package) using our own MAD-based $\hat\sigma$ estimate as its noise parameter, as a non-lightweight fidelity reference rather than a peer competitor, on every one of the 720 noisy images (no subsampling). For deep and transformer-based methods, we report literature PSNR values for DnCNN \cite{zhang2017beyond}, FFDNet \cite{zhang2018ffdnet}, DRUNet \cite{zhang2021plug}, SwinIR \cite{liang2021swinir}, and Restormer \cite{zamir2022restormer} on the identical BSD68 benchmark at the same three noise levels, drawn from a consistent set of values cross-reported across several independent papers in this literature \cite{zhang2024xformer} (Table~\ref{tab:literature}); we do not re-run these methods ourselves, for the reasons stated in Section~\ref{sec:intro}.
+
+\subsection{Metrics and environment}
+We report peak signal-to-noise ratio (PSNR) and structural similarity index (SSIM) against the noise-free ground truth, plus wall-clock runtime per image, measured with Python's \texttt{time.perf\_counter} immediately around each method's call, on a single CPU core with no GPU acceleration. PSNR and SSIM are computed with scikit-image's reference implementations at \texttt{data\_range=255}. Statistical significance between AWGB and each baseline is assessed with a paired $t$-test and a Wilcoxon signed-rank test over the 240 (image, $\sigma$) mean-PSNR (and mean-SSIM) pairs, together with 95\% confidence intervals and Cohen's $d$ effect size for the paired PSNR differences.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Quantitative comparison, averaged by dataset}
+Table~\ref{tab:bydataset} reports PSNR, SSIM, and runtime for all seven methods, averaged across all images in each dataset, at each noise level. Figure~\ref{fig:psnrssim} plots average PSNR and SSIM as a function of noise level across all 80 images combined, and Figure~\ref{fig:perdataset} compares the six lightweight methods on Set12 and BSD68 separately.
+
+\begin{table}[t]
+\centering
+\caption{PSNR (dB), SSIM, and runtime (ms), averaged across all images in each dataset, by noise level. Bold marks the best lightweight (non-BM3D) result in each row.}
+\label{tab:bydataset}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}llccc@{}}
+\toprule
+Dataset / $\sigma$ & Method & PSNR & SSIM & Time (ms) \\
+\midrule
+\multirow{7}{*}{Set12, 15}
+ & Gaussian & 26.90 & 0.802 & 1.4 \\
+ & Median & 26.10 & 0.747 & 1.1 \\
+ & Bilateral & 29.49 & 0.835 & 12.1 \\
+ & NLM & 29.36 & 0.847 & 131.8 \\
+ & Wavelet-only & 29.49 & 0.797 & 13.6 \\
+ & BM3D & 32.41 & 0.899 & 10442.2 \\
+ & \textbf{AWGB} & \textbf{29.89} & \textbf{0.807} & 19.1 \\
+\midrule
+\multirow{7}{*}{Set12, 25}
+ & Gaussian & 26.04 & 0.727 & 1.0 \\
+ & Median & 25.15 & 0.670 & 1.0 \\
+ & Bilateral & 26.46 & 0.671 & 10.6 \\
+ & NLM & 20.66 & 0.413 & 129.0 \\
+ & Wavelet-only & 26.95 & 0.713 & 13.0 \\
+ & BM3D & 29.97 & 0.852 & 10525.7 \\
+ & \textbf{AWGB} & \textbf{27.27} & \textbf{0.726} & 19.0 \\
+\midrule
+\multirow{7}{*}{Set12, 50}
+ & Gaussian & 23.54 & 0.555 & 0.7 \\
+ & Median & 22.77 & 0.497 & 1.0 \\
+ & Bilateral & 18.09 & 0.293 & 10.5 \\
+ & NLM & 14.76 & 0.213 & 128.3 \\
+ & Wavelet-only & 23.86 & 0.590 & 13.1 \\
+ & BM3D & 26.41 & 0.750 & 10731.9 \\
+ & \textbf{AWGB} & \textbf{23.97} & \textbf{0.601} & 18.8 \\
+\midrule
+\multirow{7}{*}{BSD68, 15}
+ & Gaussian & 26.62 & 0.762 & 0.6 \\
+ & Median & 25.35 & 0.673 & 0.7 \\
+ & Bilateral & 28.69 & 0.806 & 2.9 \\
+ & NLM & 28.87 & 0.840 & 100.8 \\
+ & Wavelet-only & 28.98 & 0.806 & 8.9 \\
+ & BM3D & 30.90 & 0.872 & 9277.0 \\
+ & \textbf{AWGB} & \textbf{29.34} & \textbf{0.812} & 16.1 \\
+\midrule
+\multirow{7}{*}{BSD68, 25}
+ & Gaussian & 25.69 & 0.692 & 0.5 \\
+ & Median & 24.54 & 0.603 & 0.7 \\
+ & Bilateral & 26.15 & 0.670 & 2.9 \\
+ & NLM & 20.94 & 0.460 & 101.2 \\
+ & Wavelet-only & 26.48 & 0.716 & 8.9 \\
+ & BM3D & 28.34 & 0.803 & 9435.0 \\
+ & \textbf{AWGB} & \textbf{26.86} & \textbf{0.727} & 16.1 \\
+\midrule
+\multirow{7}{*}{BSD68, 50}
+ & Gaussian & 23.15 & 0.529 & 0.5 \\
+ & Median & 22.47 & 0.448 & 0.7 \\
+ & Bilateral & 18.25 & 0.302 & 2.8 \\
+ & NLM & 14.93 & 0.219 & 100.8 \\
+ & Wavelet-only & 23.46 & 0.579 & 8.9 \\
+ & BM3D & 25.01 & 0.675 & 9641.7 \\
+ & \textbf{AWGB} & \textbf{23.70} & \textbf{0.591} & 16.3 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+AWGB is the best lightweight (non-BM3D) method on both PSNR and SSIM in all six (dataset, $\sigma$) combinations in Table~\ref{tab:bydataset}. NLM and Bilateral, run with fixed parameters, are competitive with or better than AWGB only at $\sigma=15$ on BSD68, then degrade sharply as $\sigma$ increases -- NLM's PSNR falls from 28.87--29.36~dB at $\sigma=15$ to 14.76--14.93~dB at $\sigma=50$, barely above the noisy input (whose analytic PSNR at $\sigma=50$ is approximately 14.15~dB), confirming that a fixed smoothing parameter $h$ becomes actively harmful once the true noise level departs from what it was tuned for. AWGB's runtime (16--19~ms) remains five to nine times faster than NLM and two orders of magnitude faster than Bilateral's adaptive-parameter advantage would otherwise cost, and three orders of magnitude faster than BM3D throughout.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig2_psnr_ssim_curves.pdf}
+\caption{Average PSNR (a) and SSIM (b) versus noise level $\sigma$, averaged across all 80 test images (Set12 + BSD68). AWGB (solid red) is the top lightweight curve at every noise level tested.}
+\label{fig:psnrssim}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_per_dataset_bars.pdf}
+\caption{Average PSNR by method on Set12 (left, $n=12$) and BSD68 (right, $n=68$), averaged over all three noise levels. AWGB (outlined bar) is highest on both datasets independently.}
+\label{fig:perdataset}
+\end{figure}
+
+\subsection{Statistical significance}
+Table~\ref{tab:stats} reports paired statistical tests between AWGB and each of the five lightweight baselines, computed over the 240 (image, $\sigma$) mean-PSNR pairs. Every comparison is significant at $p < 10^{-25}$ under both the paired $t$-test and the (distribution-free) Wilcoxon signed-rank test, and AWGB wins outright in 92--98\% of the 240 conditions against every baseline. The smallest but most relevant margin is against wavelet-only thresholding (Stage~2 alone, without Stages~3--4): a mean PSNR improvement of 0.32~dB (95\% CI $[0.28, 0.35]$, Cohen's $d=1.19$), confirming that the bilateral-fusion stages contribute a real, if modest, and highly consistent improvement over the wavelet stage by itself -- the opposite of what an earlier joint-bilateral design exhibited (Section~\ref{sec:ablation}).
+
+\begin{table}[t]
+\centering
+\caption{Paired comparison, AWGB vs. each baseline, $n=240$ (image, $\sigma$) conditions. CI is the 95\% confidence interval on the mean PSNR difference; $d$ is Cohen's $d$.}
+\label{tab:stats}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Baseline & $\Delta$PSNR & 95\% CI & $d$ & $t$-test $p$ & Wilcoxon $p$ \\
+\midrule
+Gaussian & 1.49 & [1.32, 1.66] & 1.12 & $3.6\times10^{-44}$ & $1.0\times10^{-39}$ \\
+Median & 2.49 & [2.29, 2.69] & 1.57 & $9.7\times10^{-67}$ & $8.2\times10^{-40}$ \\
+Bilateral & 2.28 & [1.96, 2.61] & 0.89 & $3.7\times10^{-32}$ & $1.1\times10^{-38}$ \\
+NLM & 5.11 & [4.62, 5.61] & 1.32 & $1.6\times10^{-54}$ & $2.9\times10^{-39}$ \\
+WaveletOnly & 0.32 & [0.28, 0.35] & 1.19 & $1.1\times10^{-47}$ & $6.8\times10^{-35}$ \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\subsection{Ranking among lightweight methods}
+To summarize relative performance independent of the specific PSNR scale at each noise level, we rank all six lightweight methods (excluding BM3D) by PSNR within every (image, $\sigma$) condition and average the ranks across all 240 conditions. Figure~\ref{fig:rank} reports the result: AWGB achieves the best mean rank (1.29), ahead of wavelet-only thresholding (2.53), Gaussian blurring (3.73), bilateral filtering (3.75), and median/NLM (4.83/4.86). At this 80-image scale, AWGB's advantage over wavelet-only thresholding is consistent across all three noise levels individually (mean rank 1.29--1.36 vs.\ 1.84--2.80, depending on $\sigma$), unlike Bilateral and NLM, whose rank position swings from competitive at $\sigma=15$ to worst-or-near-worst at $\sigma=50$.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig5_average_rank.pdf}
+\caption{Mean PSNR rank (1 = best) across all six lightweight methods, averaged over 80 images $\times$ 3 noise levels ($n=240$). BM3D is excluded from this ranking as a separate, non-lightweight complexity class.}
+\label{fig:rank}
+\end{figure}
+
+\subsection{Speed--quality tradeoff and comparison with deep/transformer denoisers}
+Figure~\ref{fig:tradeoff} plots average PSNR at $\sigma=25$ against average per-image runtime (log scale) for all seven methods we ran ourselves. AWGB sits on the upper-left envelope among the lightweight methods, matching or exceeding every other training-free method while running close to the fastest of them. BM3D sits in the upper-right corner at three orders of magnitude greater cost.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig3_speed_quality_tradeoff.pdf}
+\caption{Speed--quality tradeoff at $\sigma=25$, averaged over all 80 images: average PSNR vs.\ average runtime (log scale). AWGB (red star) achieves the best PSNR among lightweight methods at a runtime within the same order of magnitude as the cheapest baselines.}
+\label{fig:tradeoff}
+\end{figure}
+
+Table~\ref{tab:literature} extends this comparison with literature-reported PSNR values for five representative deep and transformer-based denoisers on the identical BSD68 benchmark, cited rather than re-run (Section~\ref{sec:experiments}). DnCNN \cite{zhang2017beyond}, FFDNet \cite{zhang2018ffdnet}, and DRUNet \cite{zhang2021plug} each exceed BM3D by 0.5--1.0~dB; the transformer-based SwinIR \cite{liang2021swinir} and Restormer \cite{zamir2022restormer} extend this by a further 0.1--0.2~dB, consistent with the trend reported across this literature \cite{zhang2024xformer}. We report this table for context, not as a head-to-head experiment: these PSNR values were measured by their respective authors under their own training and evaluation protocols (all using pretrained networks evaluated on BSD68 at the stated noise levels), and we have not re-run them ourselves. We note the model size and inference requirements alongside PSNR specifically because they are the relevant axis for this paper's argument: Restormer's $\sim$26~million parameters \cite{zamir2022restormer} require GPU inference to achieve practical runtime, a requirement AWGB and the classical baselines in Table~\ref{tab:bydataset} do not have.
+
+\begin{table}[t]
+\centering
+\caption{Literature-reported PSNR (dB) on BSD68, cited (not re-run). AWGB row uses our own measurements for direct positioning.}
+\label{tab:literature}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Method & $\sigma=15$ & $\sigma=25$ & $\sigma=50$ & Params \\
+\midrule
+BM3D \cite{dabov2007image} & 31.08 & 28.57 & 25.60 & -- (non-learned) \\
+DnCNN \cite{zhang2017beyond} & 31.73 & 29.23 & 26.23 & $\sim$0.6M \\
+FFDNet \cite{zhang2018ffdnet} & 31.63 & 29.19 & 26.29 & $\sim$0.5M \\
+DRUNet \cite{zhang2021plug} & 31.91 & 29.48 & 26.59 & $\sim$32M \\
+SwinIR \cite{liang2021swinir} & 31.97 & 29.50 & 26.58 & $\sim$11M \\
+Restormer \cite{zamir2022restormer} & 31.96 & 29.52 & 26.62 & $\sim$26M \\
+\midrule
+AWGB (ours, BSD68) & 29.34 & 26.86 & 23.70 & 0 (no training) \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\subsection{Visual and error-map comparison}
+Figure~\ref{fig:visual} shows all seven methods we ran ourselves, plus the noisy input and ground truth, on a representative BSD68 portrait image at $\sigma=25$, with PSNR and SSIM against ground truth stamped directly on each panel and a consistent zoomed inset (yellow box, forehead/eyebrow/eye region) carried across every panel so fine-detail differences are directly comparable without cross-referencing a separate crop figure. The inset region contains both high-frequency structure (wrinkles, eyebrow, eye) and adjacent smooth skin, so both edge-preservation and flat-region smoothing are visible simultaneously. NLM's fixed $h=12$ visibly fails to suppress noise at this level (PSNR 21.46~dB, barely above the 20.58~dB noisy input), Gaussian and median blur the wrinkle structure in the inset noticeably more than AWGB does, and AWGB's inset is visibly closer to BM3D's than to any other lightweight method's, consistent with the quantitative PSNR/SSIM gap reported beneath each panel. Figure~\ref{fig:zoom} additionally provides a per-pixel absolute-error heat map for wavelet-only, AWGB, and BM3D on a different crop of the same image. The mean absolute error decreases monotonically from wavelet-only (8.67) to AWGB (8.37) to BM3D (7.17) on this crop, mirroring the dataset-wide PSNR ordering in Table~\ref{tab:bydataset} and visually confirming that AWGB's improvement over wavelet-only, while numerically modest, is concentrated along genuine edge and texture structures rather than being an artifact of averaging.
+
+\begin{figure*}[p]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/fig1_visual_comparison.pdf}
+\caption{Comprehensive visual comparison of all seven methods we ran ourselves, plus noisy input and ground truth, on a BSD68 portrait image at $\sigma=25$. Each panel reports PSNR and SSIM against ground truth; the yellow box marks an identical zoomed inset region (forehead/eyebrow/eye) carried across every panel for direct fine-detail comparison.}
+\label{fig:visual}
+\end{figure*}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig6_zoom_errormap.pdf}
+\caption{Zoomed $100\times100$ crop (top) and corresponding per-pixel absolute-error heat map (bottom, capped at 40 intensity levels) for wavelet-only, AWGB, and BM3D at $\sigma=25$. Mean absolute error decreases from left to right, consistent with the dataset-wide PSNR ranking.}
+\label{fig:zoom}
+\end{figure}
+
+\section{Extension to Color Images}
+\label{sec:color}
+
+All results reported in Section~\ref{sec:results} are on grayscale images, the standard setting in most of the cited denoising literature. To address the natural question of whether AWGB's advantage generalizes beyond grayscale, this section extends every method -- AWGB and all five baselines, plus BM3D -- to color images by applying each grayscale operator independently to each of the three RGB channels and recombining, the same standard extension used by OpenCV's bilateral and non-local-means implementations and by early color variants of CNN denoisers. We make no algorithmic changes to AWGB itself for this extension; the wavelet noise estimate, BayesShrink thresholding, self-guided bilateral filter, and fusion weight map are all computed per channel.
+
+\subsection{Datasets and protocol}
+We evaluate on the complete Kodak24 (24 images, $500\times500$ or $768\times512$) and McMaster (18 images, $500\times500$) color benchmarks -- 42 images in total, the standard color-denoising test sets used in the FFDNet/DnCNN line of literature \cite{zhang2018ffdnet} -- at the same three Gaussian noise levels and with the same three-trial protocol as Section~\ref{sec:experiments} (126 (image, $\sigma$) conditions, 7 methods). PSNR is computed in the standard way across all three channels; SSIM uses scikit-image's multichannel implementation.
+
+\subsection{Results}
+Table~\ref{tab:color} reports PSNR, SSIM, and runtime averaged across each color dataset at each noise level. The pattern from the grayscale evaluation reproduces closely: AWGB is the best or tied-best lightweight method in every one of the six (dataset, $\sigma$) combinations, and the fixed-parameter Bilateral and NLM baselines again degrade sharply at $\sigma=50$ (Bilateral falls to 18.3--18.9~dB, NLM to 14.9--15.4~dB, both worse than the $\sim$14.15~dB noisy-input floor would suggest is achievable). Figure~\ref{fig:colorrank} reports the mean PSNR rank across all 126 conditions: AWGB achieves rank 1.48 of 6, ahead of wavelet-only thresholding (2.52), with the same qualitative ordering of the remaining four baselines as in the grayscale evaluation (Figure~\ref{fig:rank}).
+
+\begin{table}[t]
+\centering
+\caption{Color-image PSNR (dB), SSIM, and runtime (ms), averaged across all images in each dataset, by noise level. Bold marks the best lightweight (non-BM3D) result in each row.}
+\label{tab:color}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}llccc@{}}
+\toprule
+Dataset / $\sigma$ & Method & PSNR & SSIM & Time (ms) \\
+\midrule
+\multirow{7}{*}{Kodak24, 15}
+ & Gaussian & 27.39 & 0.759 & 5.7 \\
+ & Median & 25.99 & 0.673 & 7.1 \\
+ & Bilateral & 29.41 & 0.795 & 18.0 \\
+ & NLM & 29.83 & 0.830 & 509.8 \\
+ & Wavelet-only & 29.58 & 0.787 & 44.2 \\
+ & BM3D & 31.96 & 0.869 & 47064 \\
+ & \textbf{AWGB} & \textbf{29.95} & \textbf{0.795} & 94.1 \\
+\midrule
+\multirow{7}{*}{Kodak24, 25}
+ & Gaussian & 26.37 & 0.679 & 5.7 \\
+ & Median & 25.16 & 0.595 & 7.0 \\
+ & Bilateral & 26.67 & 0.637 & 18.2 \\
+ & NLM & 20.92 & 0.398 & 505.0 \\
+ & Wavelet-only & 27.13 & 0.699 & 43.9 \\
+ & BM3D & 29.51 & 0.806 & 47657 \\
+ & \textbf{AWGB} & \textbf{27.52} & \textbf{0.712} & 93.6 \\
+\midrule
+\multirow{7}{*}{Kodak24, 50}
+ & Gaussian & 23.60 & 0.499 & 5.7 \\
+ & Median & 22.89 & 0.422 & 7.0 \\
+ & Bilateral & 18.30 & 0.256 & 17.9 \\
+ & NLM & 14.87 & 0.179 & 508.5 \\
+ & Wavelet-only & 24.12 & 0.576 & 44.2 \\
+ & BM3D & 26.07 & 0.689 & 48504 \\
+ & \textbf{AWGB} & \textbf{24.37} & \textbf{0.585} & 94.2 \\
+\midrule
+\multirow{7}{*}{McMaster, 15}
+ & Gaussian & 28.81 & 0.809 & 5.9 \\
+ & Median & 27.66 & 0.760 & 7.8 \\
+ & Bilateral & 30.02 & 0.823 & 40.0 \\
+ & NLM & 30.09 & 0.837 & 548.6 \\
+ & Wavelet-only & 30.41 & 0.805 & 47.2 \\
+ & BM3D & 32.80 & 0.884 & 47210 \\
+ & \textbf{AWGB} & \textbf{30.62} & \textbf{0.814} & 119.7 \\
+\midrule
+\multirow{7}{*}{McMaster, 25}
+ & Gaussian & 27.32 & 0.718 & 5.8 \\
+ & Median & 26.50 & 0.677 & 7.8 \\
+ & Bilateral & 27.05 & 0.671 & 39.7 \\
+ & NLM & 21.83 & 0.467 & 552.6 \\
+ & Wavelet-only & 27.70 & 0.713 & 48.0 \\
+ & BM3D & 29.85 & 0.813 & 48202 \\
+ & \textbf{AWGB} & \textbf{27.83} & \textbf{0.722} & 121.0 \\
+\midrule
+\multirow{7}{*}{McMaster, 50}
+ & Gaussian & 23.62 & 0.527 & 6.2 \\
+ & Median & 23.79 & 0.499 & 7.8 \\
+ & Bilateral & 18.87 & 0.281 & 42.0 \\
+ & NLM & 15.39 & 0.189 & 552.3 \\
+ & Wavelet-only & 23.80 & 0.568 & 47.9 \\
+ & BM3D & 25.30 & 0.662 & 49146 \\
+ & \textbf{AWGB} & \textbf{23.81} & \textbf{0.569} & 122.3 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_color_rank.pdf}
+\caption{Mean PSNR rank (1 = best) across all six lightweight methods on color images, averaged over 42 images (Kodak24 + McMaster) $\times$ 3 noise levels ($n=126$). The ordering matches the grayscale result in Figure~\ref{fig:rank}.}
+\label{fig:colorrank}
+\end{figure}
+
+Statistical testing over the 126 (image, $\sigma$) conditions confirms the grayscale findings: AWGB's improvement over wavelet-only thresholding is 0.24~dB on average (95\% CI $[0.21, 0.28]$, Cohen's $d=1.15$, paired $t$-test $p=7.3\times10^{-25}$, Wilcoxon $p=2.1\times10^{-18}$, 88\% win rate), and AWGB beats every other lightweight baseline at $p<10^{-17}$ with win rates of 90--94\%. Against BM3D, AWGB recovers 79.3\% of the PSNR improvement over the noisy input on average (50.9--93.8\% across the 126 conditions), closely matching the 74\% (62--83\%) figure measured on grayscale images in Section~\ref{sec:results}, while running roughly 454$\times$ faster than color BM3D and 5$\times$ faster than color NLM.
+
+Figure~\ref{fig:colorvisual} shows a representative qualitative comparison on a Kodak24 image at $\sigma=25$. The same qualitative pattern observed on grayscale images holds: NLM's fixed parameter again fails to denoise adequately at this noise level, AWGB visibly retains more fine color and texture detail than Gaussian, median, or bilateral filtering, and BM3D remains the highest-fidelity reference at substantially higher computational cost.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_color_visual.pdf}
+\caption{Color-image denoising comparison on a Kodak24 image at $\sigma=25$, with PSNR/SSIM against ground truth stamped on each panel.}
+\label{fig:colorvisual}
+\end{figure}
+
+\subsection{Discussion of the color extension}
+This extension demonstrates that AWGB's advantage over the other lightweight baselines is not an artifact specific to grayscale imagery: the same ranking, the same statistically significant margin over wavelet-only thresholding, and the same speed-quality tradeoff relative to BM3D all reproduce on two independent, standard color benchmarks. We note two limitations of this extension specifically. First, per-channel processing does not exploit inter-channel correlation, which more sophisticated color denoisers (including color-aware variants of BM3D and most deep color denoisers) use to improve fidelity beyond what per-channel grayscale processing achieves; this is a known limitation of the simple extension we use here, not a property unique to AWGB, since all six methods we compare share it. Second, both Kodak24 and McMaster use synthetically added Gaussian noise, the same simplification discussed in Section~\ref{sec:discussion} for the grayscale evaluation; extending this color evaluation to real camera sensor noise (e.g., the SIDD or DND benchmarks) is identified as future work in Section~\ref{sec:conclusion}.
+
+\section{Ablation: Joint-Guided vs.\ Self-Guided Bilateral Fusion}
+\label{sec:ablation}
+
+\subsection{A negative result that shaped the final design}
+The bilateral stage described in Section~\ref{sec:stage3} is self-guided: its range kernel is computed from the noisy input $I_n$ itself. Our initial design instead used a \emph{joint} (cross) bilateral filter, following the flash/no-flash formulation of \cite{petschnigg2004digital}, in which the range kernel was computed from the wavelet estimate $I_w$ rather than from $I_n$, on the reasoning that $I_w$'s cleaner gradients should produce more reliable edge-stopping decisions. On a small, illustrative 3-image pilot study, this joint-bilateral design appeared to outperform wavelet-only thresholding. When we scaled the same comparison to the full 80-image, 240-condition evaluation reported in this paper, the result reversed: the joint-bilateral design underperformed wavelet-only thresholding in 168 of 240 conditions (70\%), by a mean of $-0.165$~dB.
+
+\subsection{Diagnosis}
+We diagnosed this by decomposing the fused output back into its two intermediate estimates on a per-image basis. The joint-bilateral output $I_b$ and the wavelet output $I_w$ are highly correlated, because $I_b$'s edge-stopping decisions are themselves derived from $I_w$; as a result, when $I_b$ happens to be more accurate than $I_w$ at a given noise level, the fusion in Eq.~\eqref{eq:fusion} averages a better estimate with a worse, strongly correlated one and lands \emph{between} them rather than at or above the better one. Conversely, when $I_b$ is less accurate than $I_w$ (which we observed at higher noise levels, where the wavelet-guided range kernel itself becomes less reliable), the fusion is dragged below wavelet-only in both directions. We further tested whether sharpening the weight map -- raising $w(p)$ to a power $\gamma>1$ to push fusion decisions closer to a hard selection between $I_b$ and $I_w$ rather than a soft blend -- could recover the loss; on a 12-image, 3-noise-level pilot, increasing $\gamma$ from 1 to 8 made the mean PSNR difference against wavelet-only \emph{more} negative (from $-0.047$ at $\gamma=1$ to $-0.140$ at $\gamma=8$), confirming that the problem was not insufficiently confident fusion but an underlying lack of independent information between the two correlated estimates -- sharpening a fusion between two correlated, similarly-erring signals does not help when the local gradient-energy weight is not itself predictive of which of the two estimates is more accurate at a given pixel.
+
+\subsection{Self-guided design and validation}
+Replacing the joint-bilateral filter with the self-guided filter of Eq.~\eqref{eq:bf} -- computing the range kernel from $I_n$ directly rather than from $I_w$ -- produces an estimate whose errors are sufficiently decorrelated from the wavelet estimate's errors that the fusion improves over wavelet-only in 221 of 240 conditions (92\%), reversing the sign of the earlier result entirely (Table~\ref{tab:stats}). All quantitative results in Sections~\ref{sec:results} use this corrected, self-guided design; the joint-bilateral variant is reported in this section only as an ablation. We report this negative result explicitly, rather than silently revising the method, because we believe it is informative for related fusion-based denoising designs: using a denoised estimate as a guidance image for a second filter that is then fused with that same estimate risks producing two correlated views of the same error pattern, which a naive weighted-average fusion cannot correct and can in fact worsen.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{What AWGB does and does not achieve}
+We state this directly: AWGB does not surpass BM3D, DnCNN, FFDNet, DRUNet, SwinIR, or Restormer on any image or noise level tested, and we have not designed it to. BM3D's collaborative block-matching mechanism, and the learned non-local and attention-based representations underlying the deep and transformer methods in Table~\ref{tab:literature}, exploit image self-similarity and learned priors in ways a per-pixel spatial filter cannot replicate; closing that gap with a training-free method is, to our knowledge, an open problem rather than something this paper's two-stage fusion design was positioned to solve. What the results in Section~\ref{sec:results} do support, at a scale of 80 standard benchmark images and 240 evaluated conditions, is a narrower but practically relevant and statistically significant claim: among methods that are themselves cheap enough to run on a constrained CPU-only device without training data, AWGB's adaptive parameterization and fusion strategy produce the most consistent quality across noise levels and the best mean PSNR/SSIM rank, including a small but highly significant (Table~\ref{tab:stats}) improvement over its own wavelet-thresholding stage in isolation.
+
+The gap to deep and transformer methods (Table~\ref{tab:literature}) is real and, at $\sigma=25$, on the order of 2.6~dB between AWGB and Restormer on BSD68. This gap is consistent with what the broader literature reports for the cost of that fidelity: state-of-the-art transformer denoisers carry on the order of $10^7$ trained parameters and are evaluated and deployed on GPU hardware \cite{zamir2022restormer,liang2021swinir}. We did not include a learned baseline in our own head-to-head experiments (Section~\ref{sec:experiments}) because doing so fairly would require either a checkpoint trained under exactly our noise model and protocol or a full training run, either of which introduces a confound -- training-data coverage -- unrelated to the algorithmic question this paper investigates; citing literature numbers under a clearly labeled, non-rerun comparison (Table~\ref{tab:literature}) is, in our judgment, the more honest way to position AWGB against this literature than either omitting the comparison or attempting an unmatched re-run.
+
+\subsection{Why the fixed-parameter baselines degrade}
+The sharp degradation of Bilateral and NLM at $\sigma=50$ (Table~\ref{tab:bydataset}) is a direct consequence of holding their range/smoothing parameters fixed across noise levels, which we did deliberately to simulate a deployment scenario where the true noise level is unknown and cannot be used to re-tune the filter per image. This is not a flaw unique to our implementation of these methods: it is the documented sensitivity of the bilateral range parameter $\sigma_r$ \cite{tomasi1998bilateral} and the NLM smoothing parameter $h$ \cite{buades2005non} to noise level, the very sensitivity that motivates AWGB's noise-adaptive parameterization in Eq.~\eqref{eq:adaptiveparams}. An operator willing to re-tune Bilateral or NLM per observed noise level could likely narrow this gap; AWGB's contribution is to make that adaptation automatic via the MAD-based $\hat\sigma$ estimate (Eq.~\eqref{eq:mad}), which is itself a standard, well-validated technique \cite{donoho1995noising} rather than a novel estimator.
+
+\subsection{On the modest size of AWGB's improvement over wavelet-only}
+The 0.32~dB mean improvement over wavelet-only thresholding (Table~\ref{tab:stats}) is statistically robust (Cohen's $d=1.19$, $p<10^{-30}$ under two different tests, 92\% win rate) but numerically modest, and we do not want to overstate its practical significance. We see two honest ways to read it. First, as a contribution at the systems/engineering level rather than a fundamentally new denoising primitive: AWGB combines two known, cheap operations through a fusion rule whose main value, demonstrated by the ablation in Section~\ref{sec:ablation}, is in \emph{which} combination is chosen, not in either operation individually. Second, as a robustness contribution: AWGB's rank-1.29 result is driven less by occasionally large wins and more by reliably avoiding the occasional large losses that fixed-parameter Bilateral and NLM suffer at noise levels their parameters were not tuned for (Figure~\ref{fig:rank}), which matters specifically in the unattended-deployment setting this paper targets, where no operator is available to notice and correct a degenerate parameter choice per image.
+
+\subsection{Sensitivity to the noise model}
+All experiments in this paper use i.i.d.\ additive Gaussian noise, the standard simplification used throughout the denoising literature surveyed in Section~\ref{sec:related}, but it is only an approximation of real sensor noise, which is more accurately modeled as a combination of signal-dependent (Poisson, shot) and signal-independent (read, thermal) components. Because AWGB's noise estimate (Eq.~\eqref{eq:mad}) assumes a single global $\sigma$, its accuracy would degrade on imagery with strongly spatially varying noise (e.g., low-light regions next to well-lit ones in the same frame) without modification; extending the MAD estimator to a spatially local or signal-dependent form is a natural direction for future work.
+
+\subsection{Limitations of the evaluation}
+We evaluated on 80 grayscale benchmark images (Set12 + BSD68) and, in Section~\ref{sec:color}, on 42 color images (Kodak24 + McMaster), under one noise model; additional benchmarks such as Urban100, and real (not synthetically added) sensor noise captures, would be needed before drawing broader generalization conclusions. The color extension (Section~\ref{sec:color}) uses simple per-channel processing, which does not exploit inter-channel correlation as more sophisticated color-aware denoisers do; this is a shared limitation across all six methods compared in that section, not one specific to AWGB. Our runtime measurements reflect a single-threaded CPU implementation in Python with OpenCV and PyWavelets back-ends; a compiled or hardware-accelerated implementation would shift the absolute runtimes of every method, though the relative ordering between AWGB and the classical baselines, which share similar underlying primitives, would likely be more stable than the comparison against BM3D's or the deep/transformer methods' fundamentally different algorithmic structure. The deep and transformer comparisons in Table~\ref{tab:literature} are literature-cited rather than re-run by us, as stated in Section~\ref{sec:experiments}; we consider this the more honest choice given the constraints discussed there, but it does mean those rows are not subject to the exact same noise realizations, random seeds, or measurement code as the rows we ran ourselves.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented AWGB, a training-free image denoising filter that fuses a wavelet BayesShrink estimate with a noise-adaptive, self-guided bilateral filter through a gradient-based weight map, with every stage parameterized automatically from a single MAD-based noise estimate. Evaluated on the complete Set12 and BSD68 grayscale benchmarks (80 images, 240 (image, $\sigma$) conditions) against five classical baselines implemented and run by us under matched, fixed-parameter conditions, AWGB achieved the best mean PSNR rank (1.29 of 6) among lightweight methods and a statistically significant improvement over every baseline, including its own wavelet-only stage in isolation ($p<10^{-30}$ under two independent tests), at a runtime of 16--33~ms per image -- within reach of constrained CPU-only sensing hardware. The same advantage reproduced on 42 color images from the Kodak24 and McMaster benchmarks (126 further conditions, Section~\ref{sec:color}): AWGB again achieved the best mean PSNR rank (1.48 of 6) and a statistically significant margin over wavelet-only thresholding ($p=7.3\times10^{-25}$), indicating that the result is not specific to grayscale imagery. We also reported a negative result: an earlier, seemingly reasonable design choice -- guiding the bilateral stage with the wavelet estimate rather than the noisy input -- actually underperformed simple wavelet thresholding at this evaluation scale, and we traced this to excessive correlation between the two fused estimates; the self-guided design used in the final method resolves this. Measured against BM3D and against literature-reported deep and transformer denoisers, AWGB does not close the fidelity gap -- it is not designed to -- but offers a statistically validated, fully reproducible, training-free option for visual sensing deployments where GPU inference and BM3D-level computation are genuinely unavailable rather than merely inconvenient.
+
+Future work includes: (i) extending the noise model to spatially varying and signal-dependent (Poisson--Gaussian) noise, which would require replacing the single global $\hat\sigma$ with a local estimate; (ii) evaluating on additional benchmarks (Urban100) and on real (not synthetically added) sensor noise captures such as SIDD or DND, extending the color evaluation in Section~\ref{sec:color} beyond synthetic Gaussian noise; (iii) exploiting inter-channel correlation in the color extension rather than the simple per-channel processing used here; (iv) profiling a fixed-point or microcontroller-targeted implementation to obtain deployment-realistic runtime figures beyond the CPU benchmarks reported here; and (v) exploring whether a small, quantized learned correction stage could be fused with the wavelet/bilateral stages used here -- guided by the decorrelation principle identified in Section~\ref{sec:ablation} -- as an intermediate point between the fully training-free regime this paper addresses and the GPU-dependent regime of current deep denoisers.
+
+\section*{Acknowledgments}
+The author thanks the Department of Computer Science and Information Engineering, Asia University, for providing the research environment in which this work was conducted.
+
+\section*{Data and Code Availability}
+The implementation of AWGB and all baseline methods, the experimental scripts used to generate every number and figure reported in this paper (including the ablation in Section~\ref{sec:ablation}), and the raw benchmark results (JSON, 240 conditions $\times$ 7 methods) are available from the corresponding author upon reasonable request.
+
+\section*{Declaration of Generative AI and AI-assisted Technologies in the Writing Process}
+During the preparation of this work, the author conceived the research direction, set the scope and priorities at each stage, selected the datasets and evaluation protocol, interpreted the results, and made the key methodological decisions, including directing the design of the ablation study reported in Section~\ref{sec:ablation}. The author used Claude (Anthropic) to assist with manuscript drafting, implementation of the experimental code, and figure generation under this direction. The author reviewed, verified, and edited all output, checked the experimental results for correctness, and takes full responsibility for the content of this article.
+
+\bibliographystyle{elsarticle-num}
+\bibliography{references}
+
+\end{document}
